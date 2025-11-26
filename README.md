@@ -37,14 +37,23 @@ Flagrep utilizes Go's concurrency primitives (`goroutines` and `channels`) to im
 - **ANSI Color Highlighting**: Visually distinguishes matched patterns in the terminal.
 
 ## Installation
-
+ 
 ```bash
-# Clone the repository
+# Install via go install
+
+go install github.com/omertheroot/flagrep@latest
+
+# Make sure your GOPATH is added to your PATH
+# e.g on Linux:
+# export PATH=$PATH:$(go env GOPATH)/bin
+
+# OR
+# Clone the repository and build
+
 git clone https://github.com/omertheroot/flagrep.git
 cd flagrep
-
-# Build the binary
 go build -o flagrep
+
 ```
 
 ## Usage
