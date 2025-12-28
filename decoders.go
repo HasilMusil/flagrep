@@ -155,38 +155,61 @@ func base64URLDecoder(input string) (string, error) {
 
 // "JBSWY3DP" -> "Hello"
 func base32Decoder(input string) (string, error) {
-	if data, err := base32.StdEncoding.DecodeString(strings.ToUpper(input)); err == nil {
+	// Keep your first "All or Nothing" check
+	inputUpper := strings.ToUpper(input)
+	if data, err := base32.StdEncoding.DecodeString(inputUpper); err == nil {
 		if isPrintableBytes(data) {
 			return string(data), nil
 		}
 	}
 
 	re := regexp.MustCompile(`[A-Z2-7]{8,}={0,6}`)
-	matches := re.FindAllStringIndex(strings.ToUpper(input), -1)
+	matches := re.FindAllStringIndex(inputUpper, -1)
 	if len(matches) == 0 {
 		return "", fmt.Errorf("no base32 found")
 	}
 
-	result := input
+	// Use a strings.Builder to prevent index nightmares
+	// IMPORTANT: Use inputUpper consistently for all slicing since regex matches are on inputUpper
+	var result strings.Builder
+	lastPos := 0
 	anyDecoded := false
 
-	for i := len(matches) - 1; i >= 0; i-- {
-		start, end := matches[i][0], matches[i][1]
-		segment := strings.ToUpper(input[start:end])
+	for _, match := range matches {
+		start, end := match[0], match[1]
 
-		decoded, err := base32.StdEncoding.DecodeString(segment)
-		if err != nil || !isPrintableBytes(decoded) {
+		// Bounds check to prevent slice panic when input/inputUpper lengths differ
+		if start > len(inputUpper) || end > len(inputUpper) {
 			continue
 		}
 
-		result = result[:start] + string(decoded) + result[end:]
-		anyDecoded = true
+		// Add the stuff BEFORE the match (from inputUpper to maintain consistency)
+		if lastPos < len(inputUpper) && start <= len(inputUpper) {
+			result.WriteString(inputUpper[lastPos:start])
+		}
+
+		segment := inputUpper[start:end]
+		decoded, err := base32.StdEncoding.DecodeString(segment)
+
+		if err == nil && isPrintableBytes(decoded) {
+			result.Write(decoded)
+			anyDecoded = true
+		} else {
+			// If it didn't decode right, just put the original back
+			result.WriteString(inputUpper[start:end])
+		}
+		lastPos = end
+	}
+
+	// Add the remaining part of the string
+	if lastPos < len(inputUpper) {
+		result.WriteString(inputUpper[lastPos:])
 	}
 
 	if !anyDecoded {
 		return "", fmt.Errorf("no valid base32 decoded")
 	}
-	return result, nil
+	return result.String(), nil
 }
 
 // "48 65 6c 6c 6f" -> "Hello"

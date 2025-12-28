@@ -1,5 +1,6 @@
 flagrep
 task.mft
 *.out
+tests/
 .vscode/
 go.work
