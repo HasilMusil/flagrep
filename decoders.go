@@ -69,7 +69,14 @@ func spaceRemovalDecoder(input string) (string, error) {
 
 // "SGVsbG8=" -> "Hello"
 func base64Decoder(input string) (string, error) {
-	if data, err := base64.StdEncoding.DecodeString(input); err == nil {
+	// Try with newlines/whitespace stripped first (for multi-line base64)
+	clean := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, input)
+	if data, err := base64.StdEncoding.DecodeString(clean); err == nil {
 		if isPrintableBytes(data) {
 			return string(data), nil
 		}
@@ -112,7 +119,14 @@ func base64Decoder(input string) (string, error) {
 }
 
 func base64URLDecoder(input string) (string, error) {
-	if data, err := base64.URLEncoding.DecodeString(input); err == nil {
+	// Try with newlines/whitespace stripped first (for multi-line base64url)
+	clean := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, input)
+	if data, err := base64.URLEncoding.DecodeString(clean); err == nil {
 		if isPrintableBytes(data) {
 			return string(data), nil
 		}
@@ -155,8 +169,14 @@ func base64URLDecoder(input string) (string, error) {
 
 // "JBSWY3DP" -> "Hello"
 func base32Decoder(input string) (string, error) {
-	// Keep your first "All or Nothing" check
-	inputUpper := strings.ToUpper(input)
+	// Strip whitespace/newlines first for multi-line base32
+	clean := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, input)
+	inputUpper := strings.ToUpper(clean)
 	if data, err := base32.StdEncoding.DecodeString(inputUpper); err == nil {
 		if isPrintableBytes(data) {
 			return string(data), nil

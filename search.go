@@ -90,7 +90,20 @@ func (s *Searcher) Run() error {
 		if err != nil {
 			return err
 		}
+		// Search whole content first
 		s.searchBFS(string(content), "(stdin)")
+		// Also search line-by-line for better detection of encoded strings
+		// This helps when piped input has multiple lines where each line
+		// contains a separate encoded string
+		lines := strings.Split(string(content), "\n")
+		if len(lines) > 1 {
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					s.searchBFS(line, "(stdin)")
+				}
+			}
+		}
 		return nil
 	}
 
