@@ -32,6 +32,8 @@ type TUI struct {
 	statusMessage string
 	oldTermios    syscall.Termios
 	searchHistory []string
+	ttyFile       *os.File // /dev/tty for keyboard input when stdin is piped
+	ttyFd         uintptr  // file descriptor for raw mode operations
 }
 
 // NewTUI creates a new TUI instance
@@ -94,16 +96,54 @@ func getTerminalSize() (int, int) {
 }
 
 func (t *TUI) enableRawMode() {
-	syscall.Syscall(syscall.SYS_IOCTL, uintptr(syscall.Stdin), uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&t.oldTermios)))
+	// Only open /dev/tty once at the start
+	if t.ttyFd == 0 {
+		// Check if stdin is a TTY by trying to get terminal attributes
+		var testTermios syscall.Termios
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(syscall.Stdin), uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&testTermios)))
+
+		if errno != 0 {
+			// stdin is not a TTY (piped input), open /dev/tty for keyboard input
+			tty, err := os.Open("/dev/tty")
+			if err != nil {
+				// Fallback: try to continue with stdin anyway
+				t.ttyFd = uintptr(syscall.Stdin)
+			} else {
+				t.ttyFile = tty
+				t.ttyFd = tty.Fd()
+			}
+		} else {
+			t.ttyFd = uintptr(syscall.Stdin)
+		}
+	}
+
+	// Get current terminal attributes from the correct fd
+	syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&t.oldTermios)))
 	newTermios := t.oldTermios
 	newTermios.Lflag &^= syscall.ICANON | syscall.ECHO
 	newTermios.Cc[syscall.VMIN] = 1
 	newTermios.Cc[syscall.VTIME] = 0
-	syscall.Syscall(syscall.SYS_IOCTL, uintptr(syscall.Stdin), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&newTermios)))
+	syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&newTermios)))
 }
 
 func (t *TUI) disableRawMode() {
-	syscall.Syscall(syscall.SYS_IOCTL, uintptr(syscall.Stdin), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&t.oldTermios)))
+	syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&t.oldTermios)))
+}
+
+// cleanup closes the tty file if it was opened
+func (t *TUI) cleanup() {
+	if t.ttyFile != nil {
+		t.ttyFile.Close()
+		t.ttyFile = nil
+	}
+}
+
+// getInputReader returns the correct reader for keyboard input
+func (t *TUI) getInputReader() *os.File {
+	if t.ttyFile != nil {
+		return t.ttyFile
+	}
+	return os.Stdin
 }
 
 // Run starts the interactive TUI
@@ -115,6 +155,7 @@ func (t *TUI) Run() {
 
 	t.enableRawMode()
 	defer t.disableRawMode()
+	defer t.cleanup()
 	fmt.Print(hideCursor)
 	defer fmt.Print(showCursor)
 
@@ -314,7 +355,7 @@ const bgMagenta = "\033[45m"
 // handleInput processes keyboard input
 func (t *TUI) handleInput() {
 	buf := make([]byte, 3)
-	n, err := os.Stdin.Read(buf)
+	n, err := t.getInputReader().Read(buf)
 	if err != nil || n == 0 {
 		return
 	}
@@ -521,7 +562,7 @@ func (t *TUI) showExpanded() {
 
 	// Wait for any key
 	buf := make([]byte, 1)
-	os.Stdin.Read(buf)
+	t.getInputReader().Read(buf)
 }
 
 func (t *TUI) copyToClipboard() {
@@ -573,7 +614,7 @@ func (t *TUI) openInEditor() {
 
 	// Open editor
 	cmd := exec.Command(editor, match.File)
-	cmd.Stdin = os.Stdin
+	cmd.Stdin = t.getInputReader()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Run()
@@ -590,7 +631,7 @@ func (t *TUI) exportResults() {
 	fmt.Print(clearScreen + moveCursor)
 
 	fmt.Print("Export filename: ")
-	reader := bufio.NewReader(os.Stdin)
+	reader := bufio.NewReader(t.getInputReader())
 	filename, _ := reader.ReadString('\n')
 	filename = strings.TrimSpace(filename)
 
@@ -702,7 +743,7 @@ func (t *TUI) showHexView() {
 	fmt.Printf("%s%sPress any key to return...%s", colorDim, colorReset, colorReset)
 
 	buf := make([]byte, 1)
-	os.Stdin.Read(buf)
+	t.getInputReader().Read(buf)
 }
 
 // showDecoderPlayground allows manually applying decoders to text
@@ -761,7 +802,7 @@ func (t *TUI) showDecoderPlayground() {
 
 		// Read input
 		buf := make([]byte, 3)
-		n, err := os.Stdin.Read(buf)
+		n, err := t.getInputReader().Read(buf)
 		if err != nil || n == 0 {
 			continue
 		}
