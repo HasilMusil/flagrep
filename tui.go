@@ -807,6 +807,21 @@ func (t *TUI) showDecoderPlayground() {
 			continue
 		}
 
+		// Handle escape sequences (arrow keys)
+		if buf[0] == 27 && n >= 3 {
+			switch buf[2] {
+			case 'A': // Up arrow
+				if selectedDecoder > 0 {
+					selectedDecoder--
+				}
+			case 'B': // Down arrow
+				if selectedDecoder < len(decoderNames)-1 {
+					selectedDecoder++
+				}
+			}
+			continue
+		}
+
 		switch buf[0] {
 		case 'q', 'Q':
 			return
