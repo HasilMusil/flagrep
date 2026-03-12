@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -21,19 +22,20 @@ type Match struct {
 
 // TUI provides an interactive terminal interface for browsing results
 type TUI struct {
-	matches       []Match
-	filteredIdx   []int // Indices into matches for filtered view
-	currentIndex  int
-	pageSize      int
-	running       bool
-	searchMode    bool
-	searchQuery   string
-	helpMode      bool
-	statusMessage string
-	oldTermios    syscall.Termios
-	searchHistory []string
-	ttyFile       *os.File // /dev/tty for keyboard input when stdin is piped
-	ttyFd         uintptr  // file descriptor for raw mode operations
+	matches        []Match
+	filteredIdx    []int // Indices into matches for filtered view
+	currentIndex   int
+	pageSize       int
+	running        bool
+	searchMode     bool
+	searchQuery    string
+	helpMode       bool
+	statusMessage  string
+	oldTermios     syscall.Termios
+	searchHistory  []string
+	ttyFile        *os.File // /dev/tty for keyboard input when stdin is piped
+	ttyFd          uintptr  // file descriptor for raw mode operations
+	rawModeEnabled bool
 }
 
 // NewTUI creates a new TUI instance
@@ -84,18 +86,30 @@ type winsize struct {
 }
 
 func getTerminalSize() (int, int) {
+	width := 80
+	height := 24
 	ws := &winsize{}
-	syscall.Syscall(syscall.SYS_IOCTL, uintptr(syscall.Stdout), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(ws)))
-	if ws.Col == 0 {
-		ws.Col = 80
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(syscall.Stdout), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(ws))); errno == 0 {
+		width = int(ws.Col)
+		height = int(ws.Row)
 	}
-	if ws.Row == 0 {
-		ws.Row = 24
+
+	// Enforce minimum values
+	if width < 20 {
+		width = 80
 	}
-	return int(ws.Col), int(ws.Row)
+	if height < 10 {
+		height = 24
+	}
+
+	return width, height
 }
 
-func (t *TUI) enableRawMode() {
+func (t *TUI) enableRawMode() error {
+	if t.rawModeEnabled {
+		return nil
+	}
+
 	// Only open /dev/tty once at the start
 	if t.ttyFd == 0 {
 		// Check if stdin is a TTY by trying to get terminal attributes
@@ -106,8 +120,7 @@ func (t *TUI) enableRawMode() {
 			// stdin is not a TTY (piped input), open /dev/tty for keyboard input
 			tty, err := os.Open("/dev/tty")
 			if err != nil {
-				// Fallback: try to continue with stdin anyway
-				t.ttyFd = uintptr(syscall.Stdin)
+				return fmt.Errorf("could not open interactive terminal: %w", err)
 			} else {
 				t.ttyFile = tty
 				t.ttyFd = tty.Fd()
@@ -118,16 +131,30 @@ func (t *TUI) enableRawMode() {
 	}
 
 	// Get current terminal attributes from the correct fd
-	syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&t.oldTermios)))
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&t.oldTermios))); errno != 0 {
+		return fmt.Errorf("could not read terminal settings: %v", errno)
+	}
 	newTermios := t.oldTermios
 	newTermios.Lflag &^= syscall.ICANON | syscall.ECHO
 	newTermios.Cc[syscall.VMIN] = 1
 	newTermios.Cc[syscall.VTIME] = 0
-	syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&newTermios)))
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&newTermios))); errno != 0 {
+		return fmt.Errorf("could not enable raw mode: %v", errno)
+	}
+
+	t.rawModeEnabled = true
+	return nil
 }
 
-func (t *TUI) disableRawMode() {
-	syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&t.oldTermios)))
+func (t *TUI) disableRawMode() error {
+	if !t.rawModeEnabled || t.ttyFd == 0 {
+		return nil
+	}
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, t.ttyFd, uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&t.oldTermios))); errno != 0 {
+		return fmt.Errorf("could not restore terminal settings: %v", errno)
+	}
+	t.rawModeEnabled = false
+	return nil
 }
 
 // cleanup closes the tty file if it was opened
@@ -136,6 +163,8 @@ func (t *TUI) cleanup() {
 		t.ttyFile.Close()
 		t.ttyFile = nil
 	}
+	t.ttyFd = 0
+	t.rawModeEnabled = false
 }
 
 // getInputReader returns the correct reader for keyboard input
@@ -153,8 +182,11 @@ func (t *TUI) Run() {
 		return
 	}
 
-	t.enableRawMode()
-	defer t.disableRawMode()
+	if err := t.enableRawMode(); err != nil {
+		fmt.Printf("TUI unavailable: %v\n", err)
+		return
+	}
+	defer func() { _ = t.disableRawMode() }()
 	defer t.cleanup()
 	fmt.Print(hideCursor)
 	defer fmt.Print(showCursor)
@@ -456,12 +488,19 @@ func (t *TUI) moveUp() {
 }
 
 func (t *TUI) moveDown() {
+	if len(t.filteredIdx) == 0 {
+		return
+	}
 	if t.currentIndex < len(t.filteredIdx)-1 {
 		t.currentIndex++
 	}
 }
 
 func (t *TUI) nextPage() {
+	if len(t.filteredIdx) == 0 {
+		t.currentIndex = 0
+		return
+	}
 	t.currentIndex += t.pageSize
 	if t.currentIndex >= len(t.filteredIdx) {
 		t.currentIndex = len(t.filteredIdx) - 1
@@ -472,6 +511,10 @@ func (t *TUI) nextPage() {
 }
 
 func (t *TUI) prevPage() {
+	if len(t.filteredIdx) == 0 {
+		t.currentIndex = 0
+		return
+	}
 	t.currentIndex -= t.pageSize
 	if t.currentIndex < 0 {
 		t.currentIndex = 0
@@ -548,10 +591,11 @@ func (t *TUI) showExpanded() {
 	context := match.Context
 	lines := strings.Split(context, "\n")
 	for _, line := range lines {
-		if len(line) > width-4 {
-			for len(line) > width-4 {
-				fmt.Printf("  %s\n", line[:width-4])
-				line = line[width-4:]
+		if len(line) > width-4 && width > 4 {
+			for len(line) > width-4 && width > 4 {
+				cutPoint := min(len(line), width-4)
+				fmt.Printf("  %s\n", line[:cutPoint])
+				line = line[cutPoint:]
 			}
 		}
 		fmt.Printf("  %s\n", line)
@@ -573,22 +617,14 @@ func (t *TUI) copyToClipboard() {
 	matchIdx := t.filteredIdx[t.currentIndex]
 	match := t.matches[matchIdx]
 
-	// Try xclip, xsel, or wl-copy
-	var cmd *exec.Cmd
-	if _, err := exec.LookPath("xclip"); err == nil {
-		cmd = exec.Command("xclip", "-selection", "clipboard")
-	} else if _, err := exec.LookPath("xsel"); err == nil {
-		cmd = exec.Command("xsel", "--clipboard", "--input")
-	} else if _, err := exec.LookPath("wl-copy"); err == nil {
-		cmd = exec.Command("wl-copy")
-	} else {
-		t.statusMessage = "No clipboard tool found (xclip/xsel/wl-copy)"
+	cmd, err := buildClipboardCommand(match.Match)
+	if err != nil {
+		t.statusMessage = err.Error()
 		return
 	}
 
-	cmd.Stdin = strings.NewReader(match.Match)
 	if err := cmd.Run(); err != nil {
-		t.statusMessage = "Failed to copy to clipboard"
+		t.statusMessage = fmt.Sprintf("Failed to copy to clipboard: %v", err)
 	} else {
 		t.statusMessage = fmt.Sprintf("Copied: %s", truncate(match.Match, 30))
 	}
@@ -602,31 +638,45 @@ func (t *TUI) openInEditor() {
 	matchIdx := t.filteredIdx[t.currentIndex]
 	match := t.matches[matchIdx]
 
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "vim"
-	}
-
 	// Restore terminal
-	t.disableRawMode()
+	if err := t.disableRawMode(); err != nil {
+		t.statusMessage = err.Error()
+		return
+	}
 	fmt.Print(showCursor)
 	fmt.Print(clearScreen + moveCursor)
 
 	// Open editor
-	cmd := exec.Command(editor, match.File)
+	cmd, err := buildEditorCommand(match.File)
+	if err != nil {
+		t.statusMessage = err.Error()
+		if rawErr := t.enableRawMode(); rawErr == nil {
+			fmt.Print(hideCursor)
+		}
+		return
+	}
 	cmd.Stdin = t.getInputReader()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Run()
+	if err := cmd.Run(); err != nil {
+		t.statusMessage = fmt.Sprintf("Editor exited with error: %v", err)
+	}
 
 	// Restore raw mode
-	t.enableRawMode()
+	if err := t.enableRawMode(); err != nil {
+		fmt.Printf("Failed to restore TUI raw mode: %v\n", err)
+		t.running = false
+		return
+	}
 	fmt.Print(hideCursor)
 }
 
 func (t *TUI) exportResults() {
 	// Restore terminal temporarily for filename input
-	t.disableRawMode()
+	if err := t.disableRawMode(); err != nil {
+		t.statusMessage = err.Error()
+		return
+	}
 	fmt.Print(showCursor)
 	fmt.Print(clearScreen + moveCursor)
 
@@ -639,7 +689,7 @@ func (t *TUI) exportResults() {
 		filename = "flagrep_results.txt"
 	}
 
-	file, err := os.Create(filename)
+	file, err := openExportFile(filename)
 	if err != nil {
 		t.statusMessage = fmt.Sprintf("Failed to create file: %v", err)
 	} else {
@@ -657,7 +707,11 @@ func (t *TUI) exportResults() {
 	}
 
 	// Restore raw mode
-	t.enableRawMode()
+	if err := t.enableRawMode(); err != nil {
+		fmt.Printf("Failed to restore TUI raw mode: %v\n", err)
+		t.running = false
+		return
+	}
 	fmt.Print(hideCursor)
 }
 
@@ -756,16 +810,17 @@ func (t *TUI) showDecoderPlayground() {
 	match := t.matches[matchIdx]
 	width, _ := getTerminalSize()
 
-	// Get available decoders
-	decoders := getDecoders()
-	decoderNames := make([]string, 0, len(decoders))
-	for name := range decoders {
-		decoderNames = append(decoderNames, name)
+	// Get available decoders in deterministic order
+	decoderEntries := getDecoderEntries()
+	decoderNames := make([]string, len(decoderEntries))
+	for i, entry := range decoderEntries {
+		decoderNames[i] = entry.Name
 	}
 
 	currentText := match.Context
 	selectedDecoder := 0
 	history := []string{currentText}
+	const maxHistory = 50 // Prevent unbounded memory growth
 
 	for {
 		fmt.Print(clearScreen + moveCursor)
@@ -835,10 +890,13 @@ func (t *TUI) showDecoderPlayground() {
 			}
 		case '\n', '\r':
 			// Apply selected decoder
-			decoderName := decoderNames[selectedDecoder]
-			decoder := decoders[decoderName]
+			decoder := decoderEntries[selectedDecoder].Func
 			result, err := decoder(currentText)
 			if err == nil && result != "" && result != currentText {
+				// Limit history size
+				if len(history) >= maxHistory {
+					history = history[1:]
+				}
 				history = append(history, currentText)
 				currentText = result
 			}
@@ -850,25 +908,116 @@ func (t *TUI) showDecoderPlayground() {
 			}
 		case 'c', 'C':
 			// Copy current text to clipboard
-			var cmd *exec.Cmd
-			if _, err := exec.LookPath("xclip"); err == nil {
-				cmd = exec.Command("xclip", "-selection", "clipboard")
-			} else if _, err := exec.LookPath("xsel"); err == nil {
-				cmd = exec.Command("xsel", "--clipboard", "--input")
-			} else if _, err := exec.LookPath("wl-copy"); err == nil {
-				cmd = exec.Command("wl-copy")
-			}
-			if cmd != nil {
-				cmd.Stdin = strings.NewReader(currentText)
+			if cmd, err := buildClipboardCommand(currentText); err == nil {
 				cmd.Run()
 			}
 		}
 	}
 }
 
+func buildClipboardCommand(content string) (*exec.Cmd, error) {
+	candidates := [][]string{
+		{"wl-copy"},
+		{"xclip", "-selection", "clipboard"},
+		{"xsel", "--clipboard", "--input"},
+		{"pbcopy"},
+		{"clip.exe"},
+	}
+
+	for _, candidate := range candidates {
+		if _, err := exec.LookPath(candidate[0]); err == nil {
+			cmd := exec.Command(candidate[0], candidate[1:]...)
+			cmd.Stdin = strings.NewReader(content)
+			return cmd, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no clipboard tool found (wl-copy/xclip/xsel/pbcopy/clip.exe)")
+}
+
+func buildEditorCommand(path string) (*exec.Cmd, error) {
+	candidates := []string{}
+	if visual := strings.TrimSpace(os.Getenv("VISUAL")); visual != "" {
+		candidates = append(candidates, visual)
+	}
+	if editor := strings.TrimSpace(os.Getenv("EDITOR")); editor != "" {
+		candidates = append(candidates, editor)
+	}
+	candidates = append(candidates, "vim", "vi", "nano", "less")
+
+	for _, candidate := range candidates {
+		parts, err := parseCommandLine(candidate)
+		if err != nil || len(parts) == 0 {
+			continue
+		}
+		if _, err := exec.LookPath(parts[0]); err == nil {
+			args := append(parts[1:], path)
+			return exec.Command(parts[0], args...), nil
+		}
+	}
+
+	return nil, fmt.Errorf("no editor found; set VISUAL or EDITOR")
+}
+
+func parseCommandLine(input string) ([]string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return nil, nil
+	}
+
+	var args []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+
+	flush := func() {
+		if current.Len() > 0 {
+			args = append(args, current.String())
+			current.Reset()
+		}
+	}
+
+	for _, r := range input {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+		case r == ' ' || r == '\t' || r == '\n':
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if escaped {
+		return nil, fmt.Errorf("unterminated escape in command")
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quote in command")
+	}
+
+	flush()
+	return args, nil
+}
+
+func openExportFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+}
+
 // CollectMatches collects matches for TUI mode instead of printing them
 type MatchCollector struct {
 	Matches []Match
+	mu      sync.Mutex
 }
 
 func NewMatchCollector() *MatchCollector {
@@ -878,6 +1027,8 @@ func NewMatchCollector() *MatchCollector {
 }
 
 func (mc *MatchCollector) Add(file string, decoders []string, match, context string, offset int) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
 	mc.Matches = append(mc.Matches, Match{
 		File:     file,
 		Decoders: decoders,

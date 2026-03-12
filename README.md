@@ -38,6 +38,7 @@ Flagrep utilizes Go's concurrency primitives (`goroutines` and `channels`) to im
 - **Shannon Entropy Filtering**: Filter files by entropy threshold to focus on encrypted/compressed content.
 - **Magic Bytes Detection**: Filter files by file type signature (ELF, MZ, PDF, PNG, etc.).
 - **Interactive TUI Mode**: Navigate results with keyboard controls in a terminal UI.
+- **Inspect Mode**: Produce hashes, header metadata, entropy summaries, extracted strings, and optional YARA-like matches.
 
 ## Installation
  
@@ -61,7 +62,7 @@ go build -o flagrep
 
 ## Usage
 
-Flagrep follows the standard `grep` usage pattern, making it intuitive for Unix users.
+Flagrep follows the standard `grep` usage pattern for searching, and also supports an inspect workflow for binary and file triage.
 
 ```bash
 # Basic search
@@ -76,6 +77,7 @@ strings malware.exe | ./flagrep "suspicious_string"
 # Advanced options
 # -workers: Set concurrency limit (default 10)
 # -depth: Set maximum decoding depth (default 2)
+# -max-bytes: Skip or reject overly large inputs unless set to 0
 ./flagrep -r -workers 50 -depth 3 "flag{" .
 
 # Entropy filtering (find high-entropy files like encrypted data)
@@ -87,9 +89,38 @@ strings malware.exe | ./flagrep "suspicious_string"
 # Interactive TUI mode (navigate results with j/k/Enter/q)
 ./flagrep -tui -r "flag" ./ctf_challenge/
 
+# Inspect mode for hashes, headers, entropy, and extracted strings
+./flagrep -inspect -inspect-heatmap -inspect-strings 10 ./sample.bin
+
+# Inspect mode with YARA-like JSON rules
+./flagrep -inspect -yara-file ./rules.json ./suspicious.bin
+
 # JSON output for scripting
 ./flagrep -r -json "password" . | jq '.file'
 ```
+
+## Inspect Mode
+
+Use inspect mode when you want structured file triage instead of pattern matching.
+
+```bash
+# Analyze a file from disk
+./flagrep -inspect ./artifact.bin
+
+# Analyze piped stdin
+cat suspicious.bin | ./flagrep -inspect
+
+# Write a starter config file
+./flagrep -write-config ./.flagrep.json
+```
+
+Inspect mode can include:
+- file hashes via [`CalculateHashesFromBytes()`](analysis.go:144)
+- magic detection via [`DetectMagic()`](magic.go:58)
+- file header parsing via [`ParseFileHeader()`](headers.go:232)
+- extracted ASCII and UTF-16 strings via [`ExtractStrings()`](analysis.go:35) and [`ExtractUnicodeStrings()`](analysis.go:76)
+- entropy heatmaps via [`RenderEntropyHeatmap()`](analysis.go:201)
+- YARA-like JSON rules via [`LoadYaraRulesFile()`](inspect.go:47) and [`MatchYaraRule()`](analysis.go:279)
 
 ## Supported Decoders
 
@@ -109,12 +140,12 @@ The following decoders are included:
 12. Octal - "110 145 154 154 157" → "Hello"
 13. URL - "%48%65%6c%6c%6f" → "Hello"
 14. HTML Entities - "&lt;" → "<"
-15. **XOR Brute-Force** - tries all single-byte XOR keys (0x01-0xFF)
-16. **Atbash Cipher** - alphabetic substitution (A↔Z, B↔Y)
-17. **Morse Code** - ".... . .-.. .-.. ---" → "HELLO"
-18. **Unicode Escapes** - "\u0048\u0065\u006c\u006c\u006f" → "Hello"
-19. **Base85/Ascii85** - compact binary-to-text encoding
-20. **Caesar/ROT-N** - brute-forces all 26 letter rotations
+15. XOR Brute-Force - tries all single-byte XOR keys (0x01-0xFF)
+16. Atbash Cipher - alphabetic substitution (A↔Z, B↔Y)
+17. Morse Code - ".... . .-.. .-.. ---" → "HELLO"
+18. Unicode Escapes - "\u0048\u0065\u006c\u006c\u006f" → "Hello"
+19. Base85/Ascii85 - compact binary-to-text encoding
+20. Caesar/ROT-N - brute-forces all 26 letter rotations
 
 The tool will try each decoder individually and in combinations to find hidden strings.
 
@@ -210,3 +241,19 @@ MIT
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Configuration
+
+Flagrep loads configuration from the first matching location:
+
+1. `./.flagreprc`
+2. `./.flagrep.json`
+3. `~/.flagreprc`
+4. `~/.flagrep.json`
+5. `~/.config/flagrep/config.json`
+
+You can generate a sample configuration with [`CreateSampleConfig()`](config.go:101) via:
+
+```bash
+./flagrep -write-config ./.flagrep.json
+```

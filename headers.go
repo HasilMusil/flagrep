@@ -157,7 +157,7 @@ func ParsePEHeader(data []byte) (*FileHeader, error) {
 
 	// Get PE header offset from DOS header
 	peOffset := binary.LittleEndian.Uint32(data[60:64])
-	if peOffset > uint32(len(data))-4 {
+	if peOffset >= uint32(len(data))-4 {
 		return nil, fmt.Errorf("invalid PE offset")
 	}
 

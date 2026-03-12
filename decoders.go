@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"html"
+	"math"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -13,6 +14,34 @@ import (
 )
 
 type DecoderFunc func(string) (string, error)
+
+type DecoderEntry struct {
+	Name string
+	Func DecoderFunc
+}
+
+// Pre-compiled regex patterns for better performance
+// These are compiled once at startup instead of on every decoder call
+var (
+	base64Pattern      = regexp.MustCompile(`[A-Za-z0-9+/]{8,}={0,2}`)
+	pureAlphaPattern   = regexp.MustCompile(`^[A-Za-z]+$`)
+	base64URLPattern   = regexp.MustCompile(`[A-Za-z0-9_-]{8,}={0,2}`)
+	base32Pattern      = regexp.MustCompile(`[A-Z2-7]{8,}={0,6}`)
+	hexSpacesPattern   = regexp.MustCompile(`\b([0-9a-fA-F]{2}(?:\s+[0-9a-fA-F]{2})+)\b`)
+	hexNoSpacesPattern = regexp.MustCompile(`\b([0-9a-fA-F]{6,})\b`)
+	hexPrefixPattern   = regexp.MustCompile(`\b((?:0x[0-9a-fA-F]{2}(?:\s+|$))+)\b`)
+	binaryOnlyPattern  = regexp.MustCompile(`^[01]+$`)
+	binaryPattern      = regexp.MustCompile(`[01]{16,}`)
+	octalPattern       = regexp.MustCompile(`\b([0-7]{1,3}(?:\s+[0-7]{1,3})+)\b`)
+	morseWordPattern   = regexp.MustCompile(`\s{2,}|/`)
+	unicodePattern     = regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
+	hexEscapePattern   = regexp.MustCompile(`\\x([0-9a-fA-F]{2})`)
+)
+
+const (
+	maxDecoderCandidateMatches = 4096
+	maxPrintableStreamResults  = 128
+)
 
 // isPrintableBytes checks if byte slice is mostly printable ASCII (≥70%)
 func isPrintableBytes(data []byte) bool {
@@ -28,29 +57,50 @@ func isPrintableBytes(data []byte) bool {
 	return float64(printable)/float64(len(data)) >= 0.7
 }
 
-func getDecoders() map[string]DecoderFunc {
-	return map[string]DecoderFunc{
-		"reverse":            reverseDecoder,
-		"space_removal":      spaceRemovalDecoder,
-		"base64":             base64Decoder,
-		"base64_url":         base64URLDecoder,
-		"base32":             base32Decoder,
-		"hex_with_spaces":    hexWithSpacesDecoder,
-		"hex_without_spaces": hexWithoutSpacesDecoder,
-		"hex_with_prefix":    hexWithPrefixDecoder,
-		"rot13":              rot13Decoder,
-		"rot47":              rot47Decoder,
-		"binary":             binaryDecoder,
-		"octal":              octalDecoder,
-		"url":                urlDecoder,
-		"html":               htmlEntityDecoder,
-		"xor_bruteforce":     xorBruteForceDecoder,
-		"atbash":             atbashDecoder,
-		"morse":              morseDecoder,
-		"unicode_escape":     unicodeEscapeDecoder,
-		"base85":             base85Decoder,
-		"caesar":             caesarBruteForceDecoder,
+func findAllStringIndicesLimited(re *regexp.Regexp, input string, limit int) (matches [][]int, truncated bool) {
+	if limit <= 0 {
+		return nil, false
 	}
+
+	matches = re.FindAllStringIndex(input, limit+1)
+	if len(matches) > limit {
+		return matches[:limit], true
+	}
+	return matches, false
+}
+
+func getDecoderEntries() []DecoderEntry {
+	return []DecoderEntry{
+		{Name: "reverse", Func: reverseDecoder},
+		{Name: "space_removal", Func: spaceRemovalDecoder},
+		{Name: "base64", Func: base64Decoder},
+		{Name: "base64_url", Func: base64URLDecoder},
+		{Name: "base32", Func: base32Decoder},
+		{Name: "hex_with_spaces", Func: hexWithSpacesDecoder},
+		{Name: "hex_without_spaces", Func: hexWithoutSpacesDecoder},
+		{Name: "hex_with_prefix", Func: hexWithPrefixDecoder},
+		{Name: "rot13", Func: rot13Decoder},
+		{Name: "rot47", Func: rot47Decoder},
+		{Name: "binary", Func: binaryDecoder},
+		{Name: "octal", Func: octalDecoder},
+		{Name: "url", Func: urlDecoder},
+		{Name: "html", Func: htmlEntityDecoder},
+		{Name: "xor_bruteforce", Func: xorBruteForceDecoder},
+		{Name: "atbash", Func: atbashDecoder},
+		{Name: "morse", Func: morseDecoder},
+		{Name: "unicode_escape", Func: unicodeEscapeDecoder},
+		{Name: "base85", Func: base85Decoder},
+		{Name: "caesar", Func: caesarBruteForceDecoder},
+	}
+}
+
+func getDecoders() map[string]DecoderFunc {
+	entries := getDecoderEntries()
+	decoders := make(map[string]DecoderFunc, len(entries))
+	for _, entry := range entries {
+		decoders[entry.Name] = entry.Func
+	}
+	return decoders
 }
 
 // "olleH" -> "Hello"
@@ -76,28 +126,63 @@ func base64Decoder(input string) (string, error) {
 		}
 		return r
 	}, input)
+
+	// If the entire input is valid base64 and decodes to printable text, use it
 	if data, err := base64.StdEncoding.DecodeString(clean); err == nil {
 		if isPrintableBytes(data) {
 			return string(data), nil
 		}
 	}
+	// Try unpadded/raw base64
+	if data, err := base64.RawStdEncoding.DecodeString(clean); err == nil {
+		if isPrintableBytes(data) {
+			return string(data), nil
+		}
+	}
 
-	re := regexp.MustCompile(`[A-Za-z0-9+/]{8,}={0,2}`)
-	matches := re.FindAllStringIndex(input, -1)
+	matches, _ := findAllStringIndicesLimited(base64Pattern, input, maxDecoderCandidateMatches)
 	if len(matches) == 0 {
 		return "", fmt.Errorf("no base64 found")
 	}
 
-	result := input
+	// Use strings.Builder to avoid index mutation bug
+	var result strings.Builder
+	lastPos := 0
 	anyDecoded := false
 
-	for i := len(matches) - 1; i >= 0; i-- {
-		start, end := matches[i][0], matches[i][1]
+	for _, match := range matches {
+		start, end := match[0], match[1]
 		segment := input[start:end]
 
+		// Add text before this match
+		result.WriteString(input[lastPos:start])
+
 		// Skip pure alphabetic words (likely regular text)
-		if regexp.MustCompile(`^[A-Za-z]+$`).MatchString(segment) {
+		if pureAlphaPattern.MatchString(segment) {
+			result.WriteString(segment)
+			lastPos = end
 			continue
+		}
+
+		// For very long segments (>1KB), use sliding window to find embedded printable base64
+		if len(segment) > 1024 {
+			found := findPrintableBase64InStream(segment)
+			if found != "" {
+				result.WriteString(found)
+				anyDecoded = true
+			} else {
+				result.WriteString(segment) // Keep original if nothing found
+			}
+			lastPos = end
+			continue
+		}
+
+		// Validate base64 length (must be multiple of 4 or valid with padding)
+		segLen := len(segment)
+		if segLen%4 != 0 {
+			// Add padding instead of trimming
+			padLen := 4 - (segLen % 4)
+			segment += strings.Repeat("=", padLen)
 		}
 
 		decoded, err := base64.StdEncoding.DecodeString(segment)
@@ -105,17 +190,68 @@ func base64Decoder(input string) (string, error) {
 			decoded, err = base64.RawStdEncoding.DecodeString(segment)
 		}
 		if err != nil || !isPrintableBytes(decoded) {
+			result.WriteString(input[start:end]) // Keep original
+			lastPos = end
 			continue
 		}
 
-		result = result[:start] + string(decoded) + result[end:]
+		result.Write(decoded)
 		anyDecoded = true
+		lastPos = end
+	}
+
+	// Add remaining text after last match
+	if lastPos < len(input) {
+		result.WriteString(input[lastPos:])
 	}
 
 	if !anyDecoded {
 		return "", fmt.Errorf("no valid base64 decoded")
 	}
-	return result, nil
+	return result.String(), nil
+}
+
+// findPrintableBase64InStream scans a long base64 stream looking for segments that decode to printable text
+func findPrintableBase64InStream(stream string) string {
+	// Try various window sizes (common flag lengths)
+	windowSizes := []int{12, 16, 20, 24, 28, 32, 36, 40, 48, 64, 80, 100, 128}
+
+	var results []string
+
+	for _, windowSize := range windowSizes {
+		// Ensure window is multiple of 4
+		windowSize = (windowSize / 4) * 4
+		if windowSize < 4 {
+			continue
+		}
+
+		// Slide through the stream
+		for i := 0; i <= len(stream)-windowSize; i += 4 {
+			segment := stream[i : i+windowSize]
+
+			decoded, err := base64.StdEncoding.DecodeString(segment)
+			if err != nil {
+				continue
+			}
+
+			// Check if decoded content is mostly printable
+			if isPrintableBytes(decoded) {
+				decodedStr := string(decoded)
+				// Only keep if it has some substance (not just whitespace)
+				if len(strings.TrimSpace(decodedStr)) >= 4 {
+					results = append(results, decodedStr)
+					if len(results) >= maxPrintableStreamResults {
+						return strings.Join(results, " | ")
+					}
+				}
+			}
+		}
+	}
+
+	if len(results) > 0 {
+		return strings.Join(results, " | ")
+	}
+	return ""
 }
 
 func base64URLDecoder(input string) (string, error) {
@@ -132,21 +268,39 @@ func base64URLDecoder(input string) (string, error) {
 		}
 	}
 
-	re := regexp.MustCompile(`[A-Za-z0-9_-]{8,}={0,2}`)
-	matches := re.FindAllStringIndex(input, -1)
+	matches, _ := findAllStringIndicesLimited(base64URLPattern, input, maxDecoderCandidateMatches)
 	if len(matches) == 0 {
 		return "", fmt.Errorf("no base64url found")
 	}
 
-	result := input
+	// Use strings.Builder to avoid index mutation bug
+	var result strings.Builder
+	lastPos := 0
 	anyDecoded := false
 
-	for i := len(matches) - 1; i >= 0; i-- {
-		start, end := matches[i][0], matches[i][1]
+	for _, match := range matches {
+		start, end := match[0], match[1]
 		segment := input[start:end]
 
-		if regexp.MustCompile(`^[A-Za-z]+$`).MatchString(segment) {
+		// Add text before this match
+		result.WriteString(input[lastPos:start])
+
+		if pureAlphaPattern.MatchString(segment) {
+			result.WriteString(segment)
+			lastPos = end
 			continue
+		}
+
+		// Validate base64url length
+		segLen := len(segment)
+		if segLen%4 != 0 {
+			segLen = (segLen / 4) * 4
+			if segLen < 4 {
+				result.WriteString(segment)
+				lastPos = end
+				continue
+			}
+			segment = segment[:segLen]
 		}
 
 		decoded, err := base64.URLEncoding.DecodeString(segment)
@@ -154,17 +308,25 @@ func base64URLDecoder(input string) (string, error) {
 			decoded, err = base64.RawURLEncoding.DecodeString(segment)
 		}
 		if err != nil || !isPrintableBytes(decoded) {
+			result.WriteString(input[start:end])
+			lastPos = end
 			continue
 		}
 
-		result = result[:start] + string(decoded) + result[end:]
+		result.Write(decoded)
 		anyDecoded = true
+		lastPos = end
+	}
+
+	// Add remaining text
+	if lastPos < len(input) {
+		result.WriteString(input[lastPos:])
 	}
 
 	if !anyDecoded {
 		return "", fmt.Errorf("no valid base64url decoded")
 	}
-	return result, nil
+	return result.String(), nil
 }
 
 // "JBSWY3DP" -> "Hello"
@@ -183,14 +345,14 @@ func base32Decoder(input string) (string, error) {
 		}
 	}
 
-	re := regexp.MustCompile(`[A-Z2-7]{8,}={0,6}`)
-	matches := re.FindAllStringIndex(inputUpper, -1)
+	re := base32Pattern
+	matches, _ := findAllStringIndicesLimited(re, inputUpper, maxDecoderCandidateMatches)
 	if len(matches) == 0 {
 		return "", fmt.Errorf("no base32 found")
 	}
 
 	// Use a strings.Builder to prevent index nightmares
-	// IMPORTANT: Use inputUpper consistently for all slicing since regex matches are on inputUpper
+	// IMPORTANT: Use original 'clean' for non-base32 parts to preserve case
 	var result strings.Builder
 	lastPos := 0
 	anyDecoded := false
@@ -203,9 +365,9 @@ func base32Decoder(input string) (string, error) {
 			continue
 		}
 
-		// Add the stuff BEFORE the match (from inputUpper to maintain consistency)
-		if lastPos < len(inputUpper) && start <= len(inputUpper) {
-			result.WriteString(inputUpper[lastPos:start])
+		// Add the stuff BEFORE the match (from original 'clean' to preserve case)
+		if lastPos < len(clean) && start <= len(clean) {
+			result.WriteString(clean[lastPos:start])
 		}
 
 		segment := inputUpper[start:end]
@@ -215,15 +377,19 @@ func base32Decoder(input string) (string, error) {
 			result.Write(decoded)
 			anyDecoded = true
 		} else {
-			// If it didn't decode right, just put the original back
-			result.WriteString(inputUpper[start:end])
+			// If it didn't decode right, put the original (not uppercased) back
+			if start < len(clean) && end <= len(clean) {
+				result.WriteString(clean[start:end])
+			} else {
+				result.WriteString(segment)
+			}
 		}
 		lastPos = end
 	}
 
-	// Add the remaining part of the string
-	if lastPos < len(inputUpper) {
-		result.WriteString(inputUpper[lastPos:])
+	// Add the remaining part of the string (from original 'clean')
+	if lastPos < len(clean) {
+		result.WriteString(clean[lastPos:])
 	}
 
 	if !anyDecoded {
@@ -234,8 +400,7 @@ func base32Decoder(input string) (string, error) {
 
 // "48 65 6c 6c 6f" -> "Hello"
 func hexWithSpacesDecoder(input string) (string, error) {
-	re := regexp.MustCompile(`\b([0-9a-fA-F]{2}(?:\s+[0-9a-fA-F]{2})+)\b`)
-	return re.ReplaceAllStringFunc(input, func(match string) string {
+	return hexSpacesPattern.ReplaceAllStringFunc(input, func(match string) string {
 		clean := strings.ReplaceAll(match, " ", "")
 		data, err := hex.DecodeString(clean)
 		if err != nil {
@@ -247,8 +412,14 @@ func hexWithSpacesDecoder(input string) (string, error) {
 
 // "48656c6c6f" -> "Hello"
 func hexWithoutSpacesDecoder(input string) (string, error) {
-	re := regexp.MustCompile(`\b([0-9a-fA-F]{6,})\b`)
-	return re.ReplaceAllStringFunc(input, func(match string) string {
+	return hexNoSpacesPattern.ReplaceAllStringFunc(input, func(match string) string {
+		// Ensure even length for hex decoding
+		if len(match)%2 != 0 {
+			match = match[:len(match)-1]
+		}
+		if len(match) < 6 {
+			return match
+		}
 		data, err := hex.DecodeString(match)
 		if err != nil {
 			return match
@@ -269,8 +440,7 @@ func hexWithoutSpacesDecoder(input string) (string, error) {
 
 // "0x48 0x65 0x6c 0x6c 0x6f" -> "Hello"
 func hexWithPrefixDecoder(input string) (string, error) {
-	re := regexp.MustCompile(`\b((?:0x[0-9a-fA-F]{2}(?:\s+|$))+)\b`)
-	return re.ReplaceAllStringFunc(input, func(match string) string {
+	return hexPrefixPattern.ReplaceAllStringFunc(input, func(match string) string {
 		clean := strings.ReplaceAll(match, "0x", "")
 		clean = strings.ReplaceAll(clean, " ", "")
 		data, err := hex.DecodeString(clean)
@@ -322,7 +492,7 @@ func binaryDecoder(input string) (string, error) {
 	clean := strings.ReplaceAll(input, " ", "")
 	clean = strings.ReplaceAll(clean, "\n", "")
 	clean = strings.ReplaceAll(clean, "\r", "")
-	if len(clean)%8 == 0 && regexp.MustCompile(`^[01]+$`).MatchString(clean) {
+	if len(clean)%8 == 0 && binaryOnlyPattern.MatchString(clean) {
 		var sb strings.Builder
 		valid := true
 		for i := 0; i < len(clean); i += 8 {
@@ -339,8 +509,7 @@ func binaryDecoder(input string) (string, error) {
 	}
 
 	// Fall back to finding embedded binary segments (min 16 bits = 2 chars)
-	re := regexp.MustCompile(`[01]{16,}`)
-	matches := re.FindAllStringIndex(input, -1)
+	matches, _ := findAllStringIndicesLimited(binaryPattern, input, maxDecoderCandidateMatches)
 	if len(matches) == 0 {
 		return "", fmt.Errorf("no binary found")
 	}
@@ -354,7 +523,7 @@ func binaryDecoder(input string) (string, error) {
 
 		// Trim to multiple of 8
 		truncLen := (len(segment) / 8) * 8
-		if truncLen < 8 {
+		if truncLen < 16 {
 			continue
 		}
 		segment = segment[:truncLen]
@@ -386,8 +555,7 @@ func binaryDecoder(input string) (string, error) {
 // "101" -> "A"
 func octalDecoder(input string) (string, error) {
 	// Find sequences of space-separated octal values (e.g., "110 145 154 154 157")
-	re := regexp.MustCompile(`\b([0-7]{1,3}(?:\s+[0-7]{1,3})+)\b`)
-	matches := re.FindAllStringIndex(input, -1)
+	matches, _ := findAllStringIndicesLimited(octalPattern, input, maxDecoderCandidateMatches)
 
 	if len(matches) == 0 {
 		parts := strings.Fields(input)
@@ -511,7 +679,7 @@ var morseToChar = map[string]rune{
 
 func morseDecoder(input string) (string, error) {
 	// Split by word separator (multiple spaces or /)
-	words := regexp.MustCompile(`\s{3,}|/`).Split(input, -1)
+	words := morseWordPattern.Split(input, -1)
 	var result strings.Builder
 
 	for i, word := range words {
@@ -535,8 +703,7 @@ func morseDecoder(input string) (string, error) {
 }
 
 func unicodeEscapeDecoder(input string) (string, error) {
-	re := regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
-	result := re.ReplaceAllStringFunc(input, func(match string) string {
+	result := unicodePattern.ReplaceAllStringFunc(input, func(match string) string {
 		code, err := strconv.ParseInt(match[2:], 16, 32)
 		if err != nil {
 			return match
@@ -544,8 +711,7 @@ func unicodeEscapeDecoder(input string) (string, error) {
 		return string(rune(code))
 	})
 
-	re2 := regexp.MustCompile(`\\x([0-9a-fA-F]{2})`)
-	result = re2.ReplaceAllStringFunc(result, func(match string) string {
+	result = hexEscapePattern.ReplaceAllStringFunc(result, func(match string) string {
 		code, err := strconv.ParseInt(match[2:], 16, 32)
 		if err != nil {
 			return match
@@ -606,6 +772,10 @@ func base85Decoder(input string) (string, error) {
 			if c < '!' || c > 'u' {
 				return "", fmt.Errorf("invalid base85 character: %c", c)
 			}
+			// Check for overflow before multiplication
+			if value > (math.MaxUint32-uint32(c-'!'))/85 {
+				return "", fmt.Errorf("base85 overflow detected")
+			}
 			value = value*85 + uint32(c-'!')
 		}
 
@@ -644,36 +814,82 @@ func base85Decoder(input string) (string, error) {
 }
 
 func caesarBruteForceDecoder(input string) (string, error) {
-	for shift := 1; shift < 26; shift++ {
-		if shift == 13 {
-			continue
-		}
+	// Try all 25 possible shifts
+	var bestResult string
+	var bestScore float64 = 0.0
+	var bestVowelCount int = -1
+	found := false
 
+	for shift := 1; shift < 26; shift++ {
 		var result strings.Builder
 		hasLetters := false
+		vowelCount := 0
 
 		for _, r := range input {
+			// Rotate letters
 			if r >= 'a' && r <= 'z' {
 				hasLetters = true
-				result.WriteRune('a' + (r-'a'+rune(shift))%26)
+				shifted := 'a' + (r-'a'+rune(shift))%26
+				result.WriteRune(shifted)
+				if isVowel(shifted) {
+					vowelCount++
+				}
 			} else if r >= 'A' && r <= 'Z' {
 				hasLetters = true
-				result.WriteRune('A' + (r-'A'+rune(shift))%26)
+				shifted := 'A' + (r-'A'+rune(shift))%26
+				result.WriteRune(shifted)
+				if isVowel(shifted) {
+					vowelCount++
+				}
 			} else {
 				result.WriteRune(r)
+				if r == ' ' {
+					vowelCount++
+				}
 			}
 		}
 
 		if !hasLetters {
-			return "", fmt.Errorf("no letters to rotate")
+			// If no letters, Caesar is meaningless
+			return "", nil
 		}
 
 		decoded := result.String()
-		// Return first result (BFS will explore all)
-		if decoded != input {
-			return decoded, nil
+		printable := 0
+		for _, b := range []byte(decoded) {
+			if (b >= 32 && b <= 126) || b == '\n' || b == '\r' || b == '\t' {
+				printable++
+			}
+		}
+
+		score := float64(printable) / float64(len(decoded))
+
+		if score > 0.9 {
+			if score > bestScore {
+				bestScore = score
+				bestResult = decoded
+				bestVowelCount = vowelCount
+				found = true
+			} else if score == bestScore {
+				if vowelCount > bestVowelCount {
+					bestResult = decoded
+					bestVowelCount = vowelCount
+					found = true
+				}
+			}
 		}
 	}
 
+	if found {
+		return bestResult, nil
+	}
 	return "", fmt.Errorf("no valid caesar shift found")
+}
+
+func isVowel(r rune) bool {
+	switch r {
+	case 'a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U':
+		return true
+	}
+	return false
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,11 @@ import (
 	"regexp"
 	"strings"
 )
+
+// bytesIndex is a helper for byte slice searching
+func bytesIndex(data, pattern []byte) int {
+	return bytes.Index(data, pattern)
+}
 
 // StringsResult contains extracted strings from a file
 type StringsResult struct {
@@ -197,9 +203,9 @@ func RenderEntropyHeatmap(data []byte, width int) string {
 		width = 80
 	}
 
-	chunkSize := len(data) / width
-	if chunkSize < 1 {
-		chunkSize = 1
+	chunkSize := 1
+	if len(data) > width {
+		chunkSize = len(data) / width
 	}
 
 	heatmap := CalculateEntropyHeatmap(data, chunkSize)
@@ -211,8 +217,8 @@ func RenderEntropyHeatmap(data []byte, width int) string {
 	result.WriteString(fmt.Sprintf("%d\n", len(data)))
 
 	for _, chunk := range heatmap {
-		// Map entropy 0-8 to characters
-		level := int(chunk.Entropy * 8 / 8)
+		// Map entropy 0-8 to index 0-3
+		level := int(chunk.Entropy)
 		chars := []rune{'░', '▒', '▓', '█'}
 		idx := level / 2
 		if idx > 3 {
@@ -241,19 +247,43 @@ type YaraString struct {
 	IsHex    bool
 	NoCase   bool
 	compiled *regexp.Regexp
+	hexBytes []byte
 }
 
 // YaraMatch represents a rule match
 type YaraMatch struct {
-	Rule    string
-	File    string
-	Matches map[string][]int // String ID -> offsets
+	Rule      string
+	File      string
+	Matches   map[string][]int // String ID -> offsets
+	Truncated map[string]bool  // String ID -> true when offsets were capped
 }
+
+const maxYaraMatchesPerString = 1024
 
 // CompileYaraRule compiles pattern strings
 func CompileYaraRule(rule *YaraRule) error {
 	for i := range rule.Strings {
 		s := &rule.Strings[i]
+		if s.IsHex {
+			normalized := strings.NewReplacer(" ", "", "\n", "", "\r", "", "\t", "").Replace(s.Pattern)
+			if normalized == "" {
+				return fmt.Errorf("empty hex pattern %s", s.ID)
+			}
+			hexBytes, err := hex.DecodeString(normalized)
+			if err != nil {
+				return fmt.Errorf("invalid hex pattern %s: %v", s.ID, err)
+			}
+			if len(hexBytes) == 0 {
+				return fmt.Errorf("empty hex pattern %s", s.ID)
+			}
+			s.hexBytes = hexBytes
+			continue
+		}
+
+		if s.Pattern == "" {
+			return fmt.Errorf("empty pattern %s", s.ID)
+		}
+
 		if s.IsRegex {
 			pattern := s.Pattern
 			if s.NoCase {
@@ -273,29 +303,45 @@ func CompileYaraRule(rule *YaraRule) error {
 func MatchYaraRule(data []byte, rule *YaraRule) *YaraMatch {
 	content := string(data)
 	matches := make(map[string][]int)
+	truncated := make(map[string]bool)
 
 	for _, s := range rule.Strings {
 		var offsets []int
+		patternTruncated := false
 
-		if s.IsRegex && s.compiled != nil {
-			locs := s.compiled.FindAllStringIndex(content, -1)
+		if s.IsRegex {
+			if s.compiled == nil {
+				continue
+			}
+
+			locs := s.compiled.FindAllStringIndex(content, maxYaraMatchesPerString+1)
+			if len(locs) > maxYaraMatchesPerString {
+				locs = locs[:maxYaraMatchesPerString]
+				patternTruncated = true
+			}
 			for _, loc := range locs {
 				offsets = append(offsets, loc[0])
 			}
 		} else if s.IsHex {
-			// Convert hex pattern to bytes and search
-			hexBytes, err := hex.DecodeString(strings.ReplaceAll(s.Pattern, " ", ""))
-			if err == nil {
-				pattern := string(hexBytes)
-				idx := 0
-				for {
-					pos := strings.Index(content[idx:], pattern)
-					if pos == -1 {
-						break
-					}
-					offsets = append(offsets, idx+pos)
-					idx += pos + len(pattern)
+			if len(s.hexBytes) == 0 {
+				continue
+			}
+
+			// Convert hex pattern to bytes and search using bytes, not strings
+			// Use byte-based search to avoid UTF-8 issues
+			dataBytes := data
+			idx := 0
+			for idx < len(dataBytes) {
+				pos := bytesIndex(dataBytes[idx:], s.hexBytes)
+				if pos == -1 {
+					break
 				}
+				offsets = append(offsets, idx+pos)
+				if len(offsets) >= maxYaraMatchesPerString {
+					patternTruncated = true
+					break
+				}
+				idx += pos + len(s.hexBytes)
 			}
 		} else {
 			// Plain text search
@@ -312,12 +358,19 @@ func MatchYaraRule(data []byte, rule *YaraRule) *YaraMatch {
 					break
 				}
 				offsets = append(offsets, idx+pos)
+				if len(offsets) >= maxYaraMatchesPerString {
+					patternTruncated = true
+					break
+				}
 				idx += pos + len(searchPattern)
 			}
 		}
 
 		if len(offsets) > 0 {
 			matches[s.ID] = offsets
+			if patternTruncated {
+				truncated[s.ID] = true
+			}
 		}
 	}
 
@@ -331,7 +384,9 @@ func MatchYaraRule(data []byte, rule *YaraRule) *YaraMatch {
 	default:
 		// Assume it's a number
 		var n int
-		fmt.Sscanf(rule.Condition, "%d", &n)
+		if _, err := fmt.Sscanf(rule.Condition, "%d", &n); err != nil {
+			return nil // Invalid condition
+		}
 		matched = len(matches) >= n
 	}
 
@@ -340,7 +395,8 @@ func MatchYaraRule(data []byte, rule *YaraRule) *YaraMatch {
 	}
 
 	return &YaraMatch{
-		Rule:    rule.Name,
-		Matches: matches,
+		Rule:      rule.Name,
+		Matches:   matches,
+		Truncated: truncated,
 	}
 }

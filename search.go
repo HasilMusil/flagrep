@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +18,7 @@ type Searcher struct {
 	Concurrency      int
 	Depth            int
 	Verbose          bool
+	DecoderEntries   []DecoderEntry
 	Decoders         map[string]DecoderFunc
 	Regexp           *regexp.Regexp
 	ContextBefore    int
@@ -27,11 +27,12 @@ type Searcher struct {
 	JsonOutput       bool
 	EntropyThreshold float64
 	MagicTypes       []string
+	MaxInputBytes    int64
 	TUIMode          bool
 	MatchCollector   *MatchCollector
 }
 
-func NewSearcher(paths []string, pattern string, recursive, caseSensitive, isRegex bool, concurrency, depth, contextBefore, contextAfter int, verbose, jsonOutput bool, excludedDirs []string, entropyThreshold float64, magicTypes []string, tuiMode bool) *Searcher {
+func NewSearcher(paths []string, pattern string, recursive, caseSensitive, isRegex bool, concurrency, depth, contextBefore, contextAfter int, verbose, jsonOutput bool, excludedDirs []string, entropyThreshold float64, magicTypes []string, maxInputBytes int64, tuiMode bool) (*Searcher, error) {
 	var regexPattern string
 	if isRegex {
 		regexPattern = pattern
@@ -43,12 +44,17 @@ func NewSearcher(paths []string, pattern string, recursive, caseSensitive, isReg
 		regexPattern = "(?i)" + regexPattern
 	}
 
-	re := regexp.MustCompile(regexPattern)
+	re, err := regexp.Compile(regexPattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid regex pattern %q: %w", pattern, err)
+	}
 
 	var collector *MatchCollector
 	if tuiMode {
 		collector = NewMatchCollector()
 	}
+
+	decoderEntries := getDecoderEntries()
 
 	return &Searcher{
 		Paths:            paths,
@@ -60,15 +66,17 @@ func NewSearcher(paths []string, pattern string, recursive, caseSensitive, isReg
 		ContextBefore:    contextBefore,
 		ContextAfter:     contextAfter,
 		Verbose:          verbose,
+		DecoderEntries:   decoderEntries,
 		Decoders:         getDecoders(),
 		Regexp:           re,
 		ExcludedDirs:     excludedDirs,
 		JsonOutput:       jsonOutput,
 		EntropyThreshold: entropyThreshold,
 		MagicTypes:       magicTypes,
+		MaxInputBytes:    maxInputBytes,
 		TUIMode:          tuiMode,
 		MatchCollector:   collector,
-	}
+	}, nil
 }
 
 func (s *Searcher) Run() error {
@@ -85,36 +93,41 @@ func (s *Searcher) Run() error {
 		}()
 	}
 
+	// Handle stdin input - process in main goroutine but still use searchBFS
+	// (stdin cannot be parallelized as it's a single stream)
 	if len(s.Paths) == 0 {
-		content, err := io.ReadAll(os.Stdin)
+		content, err := readAllWithLimit(os.Stdin, s.MaxInputBytes)
 		if err != nil {
+			close(fileChan)
+			wg.Wait()
 			return err
 		}
-		// Search whole content first
-		s.searchBFS(string(content), "(stdin)")
-		// Also search line-by-line for better detection of encoded strings
-		// This helps when piped input has multiple lines where each line
-		// contains a separate encoded string
-		lines := strings.Split(string(content), "\n")
-		if len(lines) > 1 {
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line != "" {
-					s.searchBFS(line, "(stdin)")
-				}
-			}
-		}
+		// Use a set to track already-matched content to avoid duplicates
+		seen := make(map[string]bool)
+		s.searchBFSWithDedup(string(content), "(stdin)", seen)
+		close(fileChan)
+		wg.Wait()
 		return nil
 	}
 
+	stdinConsumed := false
 	for _, path := range s.Paths {
 		if path == "-" {
-			content, err := io.ReadAll(os.Stdin)
+			if stdinConsumed {
+				if s.Verbose {
+					fmt.Printf("Skipping duplicate stdin marker\n")
+				}
+				continue
+			}
+			stdinConsumed = true
+
+			content, err := readAllWithLimit(os.Stdin, s.MaxInputBytes)
 			if err != nil {
 				fmt.Printf("Error reading stdin: %v\n", err)
 				continue
 			}
-			s.searchBFS(string(content), "(stdin)")
+			seen := make(map[string]bool)
+			s.searchBFSWithDedup(string(content), "(stdin)", seen)
 			continue
 		}
 
@@ -137,6 +150,12 @@ func (s *Searcher) walk(root string, fileChan chan<- string) error {
 	}
 
 	if !info.IsDir() {
+		if s.MaxInputBytes > 0 && info.Size() > s.MaxInputBytes {
+			if s.Verbose {
+				fmt.Printf("Skipping %s (size %d > max-bytes %d)\n", root, info.Size(), s.MaxInputBytes)
+			}
+			return nil
+		}
 		fileChan <- root
 		return nil
 	}
@@ -163,6 +182,12 @@ func (s *Searcher) walk(root string, fileChan chan<- string) error {
 				return filepath.SkipDir
 			}
 		} else {
+			if s.MaxInputBytes > 0 && info.Size() > s.MaxInputBytes {
+				if s.Verbose {
+					fmt.Printf("Skipping %s (size %d > max-bytes %d)\n", path, info.Size(), s.MaxInputBytes)
+				}
+				return nil
+			}
 			fileChan <- path
 		}
 		return nil
@@ -170,6 +195,15 @@ func (s *Searcher) walk(root string, fileChan chan<- string) error {
 }
 
 func (s *Searcher) processFile(path string) {
+	if s.MaxInputBytes > 0 {
+		if info, err := os.Stat(path); err == nil && info.Size() > s.MaxInputBytes {
+			if s.Verbose {
+				fmt.Printf("Skipping %s (size %d > max-bytes %d)\n", path, info.Size(), s.MaxInputBytes)
+			}
+			return
+		}
+	}
+
 	content, err := os.ReadFile(path)
 	if err != nil {
 		if s.Verbose {
@@ -213,7 +247,21 @@ type searchState struct {
 	depth           int
 }
 
+const maxBFSQueueSize = 10000 // Prevent unbounded memory growth
+
 func (s *Searcher) searchBFS(initialContent, path string) {
+	seen := make(map[string]bool)
+	s.searchBFSWithDedup(initialContent, path, seen)
+}
+
+func (s *Searcher) searchBFSWithDedup(initialContent, path string, seen map[string]bool) {
+	if s.MaxInputBytes > 0 && int64(len(initialContent)) > s.MaxInputBytes {
+		if s.Verbose {
+			fmt.Printf("Skipping %s (content size %d > max-bytes %d)\n", path, len(initialContent), s.MaxInputBytes)
+		}
+		return
+	}
+
 	queue := []searchState{
 		{
 			content:         initialContent,
@@ -223,8 +271,23 @@ func (s *Searcher) searchBFS(initialContent, path string) {
 	}
 
 	for len(queue) > 0 {
+		// Prevent unbounded memory growth
+		if len(queue) > maxBFSQueueSize {
+			if s.Verbose {
+				fmt.Printf("Warning: BFS queue limit reached for %s, stopping exploration\n", path)
+			}
+			break
+		}
+
 		currentState := queue[0]
 		queue = queue[1:]
+
+		// Skip if we've already seen this content
+		if seen[currentState.content] {
+			continue
+		}
+		seen[currentState.content] = true
+
 		if s.matches(currentState.content) {
 			s.printMatch(path, currentState.appliedDecoders, currentState.content)
 		}
@@ -233,12 +296,24 @@ func (s *Searcher) searchBFS(initialContent, path string) {
 			continue
 		}
 
-		for name, decoder := range s.Decoders {
-			decoded, err := decoder(currentState.content)
+		for _, entry := range s.DecoderEntries {
+			decoded, err := entry.Func(currentState.content)
 			if err == nil && decoded != "" && decoded != currentState.content {
+				if s.MaxInputBytes > 0 && int64(len(decoded)) > s.MaxInputBytes {
+					if s.Verbose {
+						fmt.Printf("Skipping decoder %s for %s (decoded size %d > max-bytes %d)\n", entry.Name, path, len(decoded), s.MaxInputBytes)
+					}
+					continue
+				}
+
+				// Skip if already visited
+				if seen[decoded] {
+					continue
+				}
+
 				newApplied := make([]string, len(currentState.appliedDecoders))
 				copy(newApplied, currentState.appliedDecoders)
-				newApplied = append(newApplied, name)
+				newApplied = append(newApplied, entry.Name)
 
 				queue = append(queue, searchState{
 					content:         decoded,

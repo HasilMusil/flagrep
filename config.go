@@ -13,6 +13,7 @@ type Config struct {
 	IgnoreCase       bool     `json:"ignore_case"`
 	Workers          int      `json:"workers"`
 	Depth            int      `json:"depth"`
+	MaxBytes         int64    `json:"max_bytes"`
 	Verbose          bool     `json:"verbose"`
 	Context          int      `json:"context"`
 	BeforeContext    int      `json:"before_context"`
@@ -23,6 +24,11 @@ type Config struct {
 	EntropyThreshold float64  `json:"entropy_threshold"`
 	MagicFilter      []string `json:"magic_filter"`
 	TUIMode          bool     `json:"tui_mode"`
+	InspectMode      bool     `json:"inspect_mode"`
+	InspectStrings   int      `json:"inspect_strings"`
+	InspectUnicode   int      `json:"inspect_unicode_strings"`
+	InspectHeatmap   bool     `json:"inspect_heatmap"`
+	YaraRuleFile     string   `json:"yara_rule_file"`
 }
 
 // DefaultConfig returns the default configuration
@@ -31,11 +37,14 @@ func DefaultConfig() *Config {
 		Recursive:        false,
 		Workers:          10,
 		Depth:            2,
+		MaxBytes:         32 << 20,
 		BeforeContext:    10,
 		AfterContext:     30,
 		ExcludeDirs:      []string{".git", "node_modules", "__pycache__", ".venv", "venv"},
 		EntropyThreshold: 0,
 		MagicFilter:      nil,
+		InspectStrings:   5,
+		InspectUnicode:   3,
 	}
 }
 

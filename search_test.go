@@ -31,17 +31,54 @@ func TestSearcher(t *testing.T) {
 	}
 
 	// plain test
-	searcher := NewSearcher([]string{plainFile}, "secret", false, false, false, 1, 2, 20, 20, false, false, nil, 0, nil, false)
+	searcher, err := NewSearcher([]string{plainFile}, "secret", false, false, false, 1, 2, 20, 20, false, false, nil, 0, nil, 0, false)
+	if err != nil {
+		t.Fatalf("NewSearcher failed: %v", err)
+	}
 	err = searcher.Run()
 	if err != nil {
 		t.Errorf("Searcher failed on plain text: %v", err)
 	}
 
 	// base64 test
-	searcher = NewSearcher([]string{b64File}, "secret", false, false, false, 1, 2, 20, 20, false, false, nil, 0, nil, false)
+	searcher, err = NewSearcher([]string{b64File}, "secret", false, false, false, 1, 2, 20, 20, false, false, nil, 0, nil, 0, false)
+	if err != nil {
+		t.Fatalf("NewSearcher failed: %v", err)
+	}
 	err = searcher.Run()
 	if err != nil {
 		t.Errorf("Searcher failed on base64 text: %v", err)
+	}
+}
+
+func TestSearcherHonorsMaxBytes(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "flagrep_maxbytes_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	content := []byte("secret secret secret secret secret")
+	file := filepath.Join(tmpDir, "large.txt")
+	if err := os.WriteFile(file, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	searcher, err := NewSearcher([]string{file}, "secret", false, false, false, 1, 1, 5, 5, false, false, nil, 0, nil, 8, true)
+	if err != nil {
+		t.Fatalf("NewSearcher failed: %v", err)
+	}
+
+	if err := searcher.Run(); err != nil {
+		t.Fatalf("Searcher failed: %v", err)
+	}
+
+	if searcher.MatchCollector == nil {
+		t.Fatal("expected match collector in TUI mode")
+	}
+
+	if len(searcher.MatchCollector.Matches) != 0 {
+		t.Fatalf("expected no matches when file exceeds max-bytes, got %d", len(searcher.MatchCollector.Matches))
 	}
 }
 
