@@ -193,3 +193,12 @@ func TestCaesarDecoder(t *testing.T) {
 		t.Errorf("Caesar decoder shift 13 got %q, want %q", decoded2, want)
 	}
 }
+
+func TestCaesarDecoderRejectsPlainEnglish(t *testing.T) {
+	input := "The quick brown fox jumps over the lazy dog"
+
+	decoded, err := caesarBruteForceDecoder(input)
+	if err == nil {
+		t.Fatalf("expected plaintext to be rejected, got %q", decoded)
+	}
+}

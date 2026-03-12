@@ -43,6 +43,127 @@ const (
 	maxPrintableStreamResults  = 128
 )
 
+var commonEnglishWords = map[string]float64{
+	"the":     3.0,
+	"and":     2.5,
+	"that":    2.0,
+	"this":    2.0,
+	"have":    1.5,
+	"for":     1.5,
+	"with":    1.5,
+	"you":     1.5,
+	"flag":    3.5,
+	"secret":  3.0,
+	"message": 2.5,
+	"quick":   1.5,
+	"brown":   1.0,
+	"jumps":   1.0,
+	"over":    1.0,
+	"lazy":    1.0,
+}
+
+var commonEnglishBigrams = []string{
+	"th", "he", "in", "er", "an", "re", "on", "at", "en", "nd",
+	"ti", "es", "or", "te", "of", "ed", "is", "it", "al", "ar",
+}
+
+func isLikelyTextByte(b byte) bool {
+	return (b >= 32 && b <= 126) || b == '\n' || b == '\r' || b == '\t'
+}
+
+func scoreTextCandidate(input string) float64 {
+	data := []byte(input)
+	if len(data) == 0 {
+		return math.Inf(-1)
+	}
+
+	printable := 0
+	letters := 0
+	vowels := 0
+	spaces := 0
+	commonLetters := 0
+	unusualPrintable := 0
+
+	for _, b := range data {
+		if !isLikelyTextByte(b) {
+			continue
+		}
+		printable++
+
+		switch {
+		case b >= 'a' && b <= 'z':
+			letters++
+			if isVowel(rune(b)) {
+				vowels++
+			}
+			if strings.ContainsRune("etaoinshrdlu", rune(b)) {
+				commonLetters++
+			}
+		case b >= 'A' && b <= 'Z':
+			letters++
+			if isVowel(rune(b)) {
+				vowels++
+			}
+			if strings.ContainsRune("ETAOINSHRDLU", rune(b)) {
+				commonLetters++
+			}
+		case b == ' ' || b == '\n' || b == '\r' || b == '\t':
+			spaces++
+		case strings.ContainsRune("~^|`\\", rune(b)):
+			unusualPrintable++
+		}
+	}
+
+	printableRatio := float64(printable) / float64(len(data))
+	if printableRatio < 0.85 {
+		return printableRatio * 2
+	}
+
+	score := printableRatio * 4
+	if letters > 0 {
+		letterRatio := float64(letters) / float64(len(data))
+		score += letterRatio * 3
+
+		vowelRatio := float64(vowels) / float64(letters)
+		score += 1.5 - math.Abs(vowelRatio-0.38)*4
+
+		commonLetterRatio := float64(commonLetters) / float64(letters)
+		score += commonLetterRatio * 2
+	} else {
+		score -= 2
+	}
+
+	spaceRatio := float64(spaces) / float64(len(data))
+	if spaces > 0 {
+		score += 1.2 - math.Abs(spaceRatio-0.18)*4
+	} else {
+		score -= 0.25
+	}
+
+	if unusualPrintable > 0 {
+		score -= float64(unusualPrintable) / float64(len(data)) * 6
+	}
+
+	lower := strings.ToLower(input)
+	for word, weight := range commonEnglishWords {
+		if strings.Contains(lower, word) {
+			score += weight
+		}
+	}
+
+	bigramHits := 0
+	for _, bigram := range commonEnglishBigrams {
+		bigramHits += strings.Count(lower, bigram)
+	}
+	score += math.Min(float64(bigramHits)*0.15, 2.5)
+
+	if strings.Contains(lower, "flag{") || strings.Contains(lower, "ctf{") {
+		score += 4
+	}
+
+	return score
+}
+
 // isPrintableBytes checks if byte slice is mostly printable ASCII (≥70%)
 func isPrintableBytes(data []byte) bool {
 	if len(data) == 0 {
@@ -622,29 +743,32 @@ func htmlEntityDecoder(input string) (string, error) {
 }
 
 // XOR brute-force decoder: tries all single-byte XOR keys (0x01-0xFF)
-// Returns decoded string if ≥80% of characters are printable ASCII
+// Scores every candidate and returns the most text-like result.
 func xorBruteForceDecoder(input string) (string, error) {
 	data := []byte(input)
 	if len(data) == 0 {
 		return "", fmt.Errorf("empty input")
 	}
 
+	bestScore := math.Inf(-1)
+	bestResult := ""
+
 	for key := byte(1); key != 0; key++ { // 1-255
 		decoded := make([]byte, len(data))
-		printable := 0
 
 		for i, b := range data {
 			decoded[i] = b ^ key
-			// Check if printable ASCII (32-126) or common whitespace
-			if (decoded[i] >= 32 && decoded[i] <= 126) || decoded[i] == '\n' || decoded[i] == '\r' || decoded[i] == '\t' {
-				printable++
-			}
 		}
 
-		// Return if ≥80% printable
-		if float64(printable)/float64(len(decoded)) >= 0.8 {
-			return string(decoded), nil
+		score := scoreTextCandidate(string(decoded))
+		if score > bestScore {
+			bestScore = score
+			bestResult = string(decoded)
 		}
+	}
+
+	if bestScore >= 5.0 {
+		return bestResult, nil
 	}
 
 	return "", fmt.Errorf("no valid XOR key found")
@@ -814,75 +938,52 @@ func base85Decoder(input string) (string, error) {
 }
 
 func caesarBruteForceDecoder(input string) (string, error) {
-	// Try all 25 possible shifts
-	var bestResult string
-	var bestScore float64 = 0.0
-	var bestVowelCount int = -1
-	found := false
+	inputScore := scoreTextCandidate(input)
+	bestResult := ""
+	bestScore := math.Inf(-1)
+	hasLetters := false
 
 	for shift := 1; shift < 26; shift++ {
 		var result strings.Builder
-		hasLetters := false
-		vowelCount := 0
+		shiftHasLetters := false
 
 		for _, r := range input {
 			// Rotate letters
 			if r >= 'a' && r <= 'z' {
 				hasLetters = true
-				shifted := 'a' + (r-'a'+rune(shift))%26
+				shiftHasLetters = true
+				shifted := 'a' + (r-'a'-rune(shift)+26)%26
 				result.WriteRune(shifted)
-				if isVowel(shifted) {
-					vowelCount++
-				}
 			} else if r >= 'A' && r <= 'Z' {
 				hasLetters = true
-				shifted := 'A' + (r-'A'+rune(shift))%26
+				shiftHasLetters = true
+				shifted := 'A' + (r-'A'-rune(shift)+26)%26
 				result.WriteRune(shifted)
-				if isVowel(shifted) {
-					vowelCount++
-				}
 			} else {
 				result.WriteRune(r)
-				if r == ' ' {
-					vowelCount++
-				}
 			}
 		}
 
-		if !hasLetters {
-			// If no letters, Caesar is meaningless
-			return "", nil
+		if !shiftHasLetters {
+			continue
 		}
 
 		decoded := result.String()
-		printable := 0
-		for _, b := range []byte(decoded) {
-			if (b >= 32 && b <= 126) || b == '\n' || b == '\r' || b == '\t' {
-				printable++
-			}
-		}
-
-		score := float64(printable) / float64(len(decoded))
-
-		if score > 0.9 {
-			if score > bestScore {
-				bestScore = score
-				bestResult = decoded
-				bestVowelCount = vowelCount
-				found = true
-			} else if score == bestScore {
-				if vowelCount > bestVowelCount {
-					bestResult = decoded
-					bestVowelCount = vowelCount
-					found = true
-				}
-			}
+		score := scoreTextCandidate(decoded)
+		if score > bestScore {
+			bestScore = score
+			bestResult = decoded
 		}
 	}
 
-	if found {
+	if !hasLetters {
+		return "", nil
+	}
+
+	if bestScore >= 8.0 && bestScore > inputScore+1.0 {
 		return bestResult, nil
 	}
+
 	return "", fmt.Errorf("no valid caesar shift found")
 }
 

@@ -104,8 +104,8 @@ func TestDecoders(t *testing.T) {
 	}
 
 	// Test XOR brute-force
-	// The decoder tries keys 1-255 and returns first result with ≥80% printable
-	// Test with "This is a secret" XOR'd with 0x55 - longer text reduces false positives
+	// The decoder should score all keys and choose the most plausible plaintext.
+	// Test with a longer sentence XOR'd with 0x55 to ensure it prefers the real key.
 	plaintext := "This is a secret message for testing XOR decoder"
 	key := byte(0x55)
 	xorBytes := make([]byte, len(plaintext))
@@ -117,19 +117,8 @@ func TestDecoders(t *testing.T) {
 	if err != nil {
 		t.Errorf("XOR decoder failed: %v", err)
 	}
-	// Verify the result is printable and matches expected output
 	if xorResult != plaintext {
-		// It's acceptable if a different key produces valid output, just verify it's printable
-		printable := 0
-		for _, r := range xorResult {
-			if r >= 32 && r <= 126 {
-				printable++
-			}
-		}
-		ratio := float64(printable) / float64(len(xorResult))
-		if ratio < 0.8 {
-			t.Errorf("XOR decoder result not printable enough: %.2f ratio, got %q", ratio, xorResult)
-		}
+		t.Errorf("XOR decoder got %q, want %q", xorResult, plaintext)
 	}
 }
 
